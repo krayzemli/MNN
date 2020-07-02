@@ -31,11 +31,10 @@ static MNN::DataType _dataTypeMap(tflite::TensorType type) {
 }
 
 static void _converteConstantDataToMNNConstantNode(
-    int tensorIndex, const std::vector<std::unique_ptr<tflite::TensorT>>& tfliteTensors,
+    int tensorIndex, const tflite::TensorT * tensor,
     const std::vector<std::unique_ptr<tflite::BufferT>>& tfliteModelBuffers, std::unique_ptr<MNN::NetT>& MNNNetT) {
     // check whether buffer data size is greater than zero,
     // if size > 0, then this tensor is Constant, convete this tensor to be MNN Constant node
-    const auto& tensor         = tfliteTensors[tensorIndex];
     const uint32_t bufferIndex = tensor->buffer;
     const auto tensorBuffer    = tfliteModelBuffers[bufferIndex]->data;
     const auto bufferSize      = tensorBuffer.size();
@@ -62,7 +61,7 @@ static void _converteConstantDataToMNNConstantNode(
         mnnBlob->int32s.resize(bufferSize / 4);
         memcpy(mnnBlob->int32s.data(), tensorBuffer.data(), bufferSize);
     } else {
-        DCHECK(false) << "TODO support other data type!";
+        DCHECK(false) << "TODO support other data type! dataType = " << mnnBlob->dataType << ", tensorType == " << tensor->type;
     }
     mnnConstantOp->main.value = mnnBlob.release();
 
@@ -96,6 +95,7 @@ static bool needExtractInput(uint32_t opCode) {
     NONEED(tflite::BuiltinOperator_RESIZE_BILINEAR);
     NONEED(tflite::BuiltinOperator_RESIZE_NEAREST_NEIGHBOR);
     NONEED(tflite::BuiltinOperator_SOFTMAX);
+    NONEED(tflite::BuiltinOperator_CUSTOM);
 
 
     return true;
@@ -137,6 +137,10 @@ int tflite2MNNNet(const std::string inputModel, const std::string bizCode, std::
     }
     auto& buffers = tfliteModel->buffers;
 
+    MNN::OpT * pDetectorMnnOp = nullptr;
+    std::vector<const tflite::TensorT*> detectorTensors;
+    int maxTensorIndex = -1;
+
     for (int i = 0; i < subGraphsSize; ++i) {
         const auto& ops     = tfliteModel->subgraphs[i]->operators;
         const auto& tensors = tfliteModel->subgraphs[i]->tensors;
@@ -160,7 +164,8 @@ int tflite2MNNNet(const std::string inputModel, const std::string bizCode, std::
             inputOp->outputIndexes.push_back(index);
             MNNNetT->oplists.emplace_back(inputOp);
         }
-
+        if (maxTensorIndex < (int)(tensors.size() - 1))
+            maxTensorIndex = tensors.size() - 1;
         // set output names
         for (int k = 0; k < tfliteModel->subgraphs[i]->outputs.size(); ++k) {
             MNNNetT->outputName.push_back(tensors[tfliteModel->subgraphs[i]->outputs[k]]->name);
@@ -225,14 +230,6 @@ int tflite2MNNNet(const std::string inputModel, const std::string bizCode, std::
                 }
             }
 
-
-            if (opCode == tflite::BuiltinOperator_CUSTOM) {
-                const int inputSize = ops[j]->inputs.size();
-                for (int k = 0; k < inputSize; ++k) {
-                    _converteConstantDataToMNNConstantNode(ops[j]->inputs[k], tensors, tfliteModelBuffer, MNNNetT);
-                }
-            }
-
             MNN::OpT* op = new MNN::OpT;
             auto creator = liteOpConverterSuit::get()->search(opCode);
             DCHECK(creator) << "NOT_SUPPORTED_OP: [ " << tflite::EnumNameBuiltinOperator(opCode) << " ]";
@@ -250,11 +247,119 @@ int tflite2MNNNet(const std::string inputModel, const std::string bizCode, std::
             for (int i = 0; i < ops[j]->outputs.size(); i++) {
                 op->outputIndexes[i] = ops[j]->outputs[i];
             }
+
+            if (quantizedModel && opCode == tflite::BuiltinOperator_CUSTOM && tfliteOpSet[opcodeIndex]->custom_code == "TFLite_Detection_PostProcess")
+            {
+                DCHECK(pDetectorMnnOp == nullptr) << "Only one PostProcess supported";
+                pDetectorMnnOp = op;
+                const int inputSize = ops[j]->inputs.size();
+                for (int k = 0; k < inputSize; ++k)
+                    detectorTensors.push_back(tensors[ops[j]->inputs[k]].get());
+            }
+            else  if (opCode == tflite::BuiltinOperator_CUSTOM) {
+                const int inputSize = ops[j]->inputs.size();
+                for (int k = 0; k < inputSize; ++k) {
+                    _converteConstantDataToMNNConstantNode(ops[j]->inputs[k], tensors[ops[j]->inputs[k]].get(), tfliteModelBuffer, MNNNetT);
+                }
+            }
             // Run actual conversion
             creator->run(op, ops[j], tensors, tfliteModelBuffer, tfliteOpSet, quantizedModel);
             MNNNetT->oplists.emplace_back(op);
         }
     }
+    if (!!pDetectorMnnOp)
+    {
+        DCHECK(MNNNetT->tensorName.size() == (maxTensorIndex + 1)) << MNNNetT->tensorName.size() << "names, " << (maxTensorIndex+1) << "indices";
+        int cnt = pDetectorMnnOp->inputIndexes.size();
+        for (int k = 0; k < cnt; ++k)
+        {
+            int idx = pDetectorMnnOp->inputIndexes[k];
+            const auto tensor = detectorTensors[k];
+            const auto tensorBuffer = tfliteModelBuffer[tensor->buffer]->data;
+            const auto bufferSize = tensorBuffer.size();
+            DCHECK(tensor->quantization != nullptr) << "PostProcess tensor quantization missing";
+            DCHECK(tensor->quantization->zero_point.size() == 1);
+            DCHECK(tensor->quantization->scale.size() == 1);
+            float qZero = tensor->quantization->zero_point[0];
+            float qScale = tensor->quantization->scale[0];
+            if (bufferSize == 0)
+            {
+                LOG(INFO) << "Adding dequantize for tensor " << tensor->name;
+                std::unique_ptr<MNN::OpT> mnnConstantOp1(new MNN::OpT);
+                std::unique_ptr<MNN::OpT> mnnConstantOp2(new MNN::OpT);
+                mnnConstantOp1->name      = tensor->name + "_DQMIN";
+                mnnConstantOp1->type      = MNN::OpType_Const;
+                mnnConstantOp1->main.type = MNN::OpParameter_Blob;
+                mnnConstantOp1->outputIndexes.push_back(++maxTensorIndex);
+                mnnConstantOp2->name      = tensor->name + "_DQMAX";
+                mnnConstantOp2->type      = MNN::OpType_Const;
+                mnnConstantOp2->main.type = MNN::OpParameter_Blob;
+                mnnConstantOp2->outputIndexes.push_back(++maxTensorIndex);
+                std::unique_ptr<MNN::BlobT> mnnBlob1(new MNN::BlobT);
+                std::unique_ptr<MNN::BlobT> mnnBlob2(new MNN::BlobT);
+                mnnBlob1->dataType   = MNN::DataType_DT_FLOAT;
+                mnnBlob1->dataFormat = MNN::MNN_DATA_FORMAT_NHWC;
+                mnnBlob1->dims.push_back(1);
+                mnnBlob1->dims.push_back(1);
+                mnnBlob1->dims.push_back(1);
+                mnnBlob1->dims.push_back(1);
+                mnnBlob1->float32s.push_back((0 - qZero) * qScale);
+                mnnBlob2->dataType   = MNN::DataType_DT_FLOAT;
+                mnnBlob2->dataFormat = MNN::MNN_DATA_FORMAT_NHWC;
+                mnnBlob2->dims.push_back(1);
+                mnnBlob2->dims.push_back(1);
+                mnnBlob2->dims.push_back(1);
+                mnnBlob2->dims.push_back(1);
+                mnnBlob2->float32s.push_back((255 - qZero) * qScale);
+                mnnConstantOp1->main.value = mnnBlob1.release();
+                mnnConstantOp2->main.value = mnnBlob2.release();
+                MNNNetT->tensorName.emplace_back(mnnConstantOp1->name);
+                MNNNetT->tensorName.emplace_back(mnnConstantOp2->name);
+                MNNNetT->oplists.emplace_back(std::move(mnnConstantOp1));
+                MNNNetT->oplists.emplace_back(std::move(mnnConstantOp2));
+
+                std::unique_ptr<MNN::OpT> mnnDequantOp(new MNN::OpT);
+                mnnDequantOp->name      = tensor->name + "_DQ";
+                mnnDequantOp->type      = MNN::OpType_Dequantize;
+                mnnDequantOp->main.type = MNN::OpParameter_Dequantize;
+                mnnDequantOp->outputIndexes.push_back(++maxTensorIndex);
+                mnnDequantOp->inputIndexes.push_back(idx);
+                mnnDequantOp->inputIndexes.push_back(maxTensorIndex-2);
+                mnnDequantOp->inputIndexes.push_back(maxTensorIndex-1);
+                std::unique_ptr<MNN::DequantizeT> mnnDeqPrm(new MNN::DequantizeT);
+                mnnDeqPrm->mode = MNN::QuantizeMode_MIN_COMBINED;
+                mnnDeqPrm->modelFormat = MNN::ModeFormat_TENSORFLOW;
+                mnnDeqPrm->type = MNN::DataType_DT_QUINT8;
+                mnnDeqPrm->inputQuantizedParam = std::unique_ptr<MNN::QuantizedParamT>(new MNN::QuantizedParamT);
+                mnnDeqPrm->inputQuantizedParam->zeroPoint = tensor->quantization->zero_point[0];
+                mnnDeqPrm->inputQuantizedParam->scale     = tensor->quantization->scale[0];
+
+                mnnDequantOp->main.value = mnnDeqPrm.release();
+                MNNNetT->tensorName.emplace_back(mnnDequantOp->name);
+                MNNNetT->oplists.emplace_back(std::move(mnnDequantOp));
+                pDetectorMnnOp->inputIndexes[k] = maxTensorIndex;
+            }
+            else
+            {
+                LOG(INFO) << "Adding constant operator for tensor " << tensor->name;
+                DCHECK(tensor->type == tflite::TensorType_UINT8);
+                std::unique_ptr<MNN::OpT> mnnConstantOp(new MNN::OpT);
+                mnnConstantOp->name      = tensor->name;
+                mnnConstantOp->type      = MNN::OpType_Const;
+                mnnConstantOp->main.type = MNN::OpParameter_Blob;
+                mnnConstantOp->outputIndexes.push_back(idx);
+                std::unique_ptr<MNN::BlobT> mnnBlob(new MNN::BlobT);
+                mnnBlob->dataType   = MNN::DataType_DT_FLOAT;
+                mnnBlob->dataFormat = MNN::MNN_DATA_FORMAT_NHWC;
+                mnnBlob->dims = tensor->shape;
+                for (unsigned int v : tensorBuffer)
+                    mnnBlob->float32s.push_back(((float)v - qZero) * qScale);
+                mnnConstantOp->main.value = mnnBlob.release();
+                MNNNetT->oplists.emplace_back(std::move(mnnConstantOp));
+            }
+        }
+    }
+
 
     MNNNetT->sourceType = MNN::NetSource_TFLITE;
     MNNNetT->bizCode    = bizCode;
