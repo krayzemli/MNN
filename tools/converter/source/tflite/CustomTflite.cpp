@@ -13,7 +13,6 @@
 DECLARE_OP_COVERTER(CustomTflite);
 
 MNN::OpType CustomTflite::opType(bool quantizedModel) {
-    DCHECK(!quantizedModel) << "Not support quantized model";
     return MNN::OpType_DetectionPostProcess;
 }
 
